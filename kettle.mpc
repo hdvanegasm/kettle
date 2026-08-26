@@ -1,0 +1,304 @@
+# ==========================================
+# TYPES
+# ==========================================
+
+# The benchmark script also compiles this file with -R 64,
+# where the ring size already fixes the bit length.
+if not program.options.ring:
+    program.bit_length = 32
+
+N = 1024
+
+RCDT_BITS = 78  # precision of the reverse cumulative distribution tables
+RCDT_LEN = 13   # entries per table
+
+# ==========================================
+# 0. RCDT CONSTANTS (HAWK-1024)
+# ==========================================
+RCDT_0_VALS = [
+    0x2C583AAA2EB76504E560, 0x0F1D70E1C03E49BB683E, 0x031955CDA662EF2D1C48,
+    0x005E31E874B355421BB7, 0x000657C0676C029895A7, 0x00003D4D67696E51F820,
+    0x0000014A1A8A93F20738, 0x00000003DAF47E8DFB21, 0x0000000006634617B3FF,
+    0x000000000005DBEFB646, 0x00000000000002F93038, 0x0000000000000000D5A7,
+    0x00000000000000000021,
+]
+
+RCDT_1_VALS = [
+    0x1B7F01AE2B17728DF2DE, 0x07506A00B82C69624C93, 0x01252685DB30348656A4,
+    0x001A430192770E205503, 0x00015353BD4091AA96DB, 0x000009915A53D8667BEE,
+    0x00000026670030160D5F, 0x00000000557CD1C5F797, 0x00000000006965E15B13,
+    0x00000000000047E9AB38, 0x000000000000001B2445, 0x000000000000000005AA,
+    0x00000000000000000000,
+]
+
+# ==========================================
+# OUTIL : TREE COMPARISON (LOG DEPTH = 7)
+# ==========================================
+# Computes the comparison u < C against a *public* constant C, on the bit-sliced
+# layout: u_bits[i] is one sbits register holding bit i of every lane.
+#
+# `memo` shares subtrees across the 13 comparisons that
+# read one u_bits list -- the long zero prefixes are computed once.
+def is_public(x):
+    return isinstance(x, int)
+
+
+def safe_and(a, b):
+    if is_public(a):
+        return b if a else 0
+    if is_public(b):
+        return a if b else 0
+    return a & b
+
+
+def safe_xor(a, b):
+    if is_public(a) and is_public(b):
+        return a ^ b
+    if is_public(a):
+        return ~b if a else b
+    if is_public(b):
+        return ~a if b else a
+    return a ^ b
+
+
+def tree_compare_constant(u_bits, C_val, memo=None, offset=0):
+    """u < C_val on the bit-sliced layout, with a compile-time subtree cache.
+
+    `memo` is that cache: it maps a subproblem to the (less, eq) pair already
+    built for it, so the recursion emits each distinct subtree once instead of
+    rebuilding it. It is pure common-subexpression elimination -- the circuit
+    computes the same thing without it, just at more AND gates.
+    """
+    if memo is None:
+        memo = {}
+
+    n = len(u_bits)
+    key = (offset, n, C_val)
+    if key in memo:
+        return memo[key]
+
+    if n == 1:
+        u = u_bits[0]
+        if (C_val & 1) == 1:
+            res = ~u, u
+        else:
+            res = 0, ~u
+    else:
+        mid = n // 2
+        C_lo = C_val & ((1 << mid) - 1)
+        C_hi = C_val >> mid
+
+        less_hi, eq_hi = tree_compare_constant(u_bits[mid:], C_hi, memo, offset + mid)
+        less_lo, eq_lo = tree_compare_constant(u_bits[:mid], C_lo, memo, offset)
+
+        eq = safe_and(eq_hi, eq_lo)
+        less = safe_xor(less_hi, safe_and(eq_hi, less_lo))
+        res = less, eq
+
+    memo[key] = res
+    return res
+
+
+# ==========================================
+# 1. OFFLINE BITWISE GAUSSIAN SAMPLING
+# ==========================================
+def random_bits_binary(n_bits, size):
+    """`n_bits` fresh random bits per lane, least significant first.
+
+    Returns `n_bits` sbits registers, each `size` lanes wide, which is the
+    bit-sliced layout tree_compare_constant consumes.
+    """
+    bits = []
+    for _ in range(n_bits):
+        lane_bits = [sbit.get_random_bit() for _ in range(size)]
+        bits.append(sbits.trans(lane_bits)[0])
+    return bits
+
+
+def to_arithmetic(bit, size):
+    """Binary -> arithmetic share of one bit per lane, via a vectorised daBit.
+
+    A comparison that folded to a public constant needs no conversion at all.
+    """
+    if is_public(bit):
+        return bit
+    # sbits is not a types._register, so vectorize_init cannot infer the size.
+    return sint(bit, size=size)
+
+
+def generate_gaussian_samples_dabit_simd(size):
+    x0_arr = sint.Array(size)
+    x1_arr = sint.Array(size)
+
+    # 1.1 Generation of U 78-bit random, one independent U per lane.
+    U0_bits = random_bits_binary(RCDT_BITS, size)
+    U1_bits = random_bits_binary(RCDT_BITS, size)
+
+    b0_p_vecs = []
+    b1_p_vecs = []
+
+    # 1.2 Tree comparison against the public RCDT.
+    memo0 = {}
+    memo1 = {}
+    for j in range(RCDT_LEN):
+        is_less_0 = tree_compare_constant(U0_bits, RCDT_0_VALS[j], memo0)[0]
+        is_less_1 = tree_compare_constant(U1_bits, RCDT_1_VALS[j], memo1)[0]
+
+        b0_p_vecs.append(is_less_0)
+        b1_p_vecs.append(is_less_1)
+
+    # 1.3 Vector arithmetic reconstruction Z_{2^32}
+    h0_vec = sint(0, size=size)
+    h1_vec = sint(0, size=size)
+
+    for j in range(RCDT_LEN):
+        h0_vec += to_arithmetic(b0_p_vecs[j], size)
+        h1_vec += to_arithmetic(b1_p_vecs[j], size)
+
+    # 1.4 Sign application
+    s0_vec = sint.get_random_bit(size=size)
+    s1_vec = sint.get_random_bit(size=size)
+
+    x0_vec = (1 - s0_vec * 2) * (h0_vec * 2)
+    x1_vec = (1 - s1_vec * 2) * (h1_vec * 2 + 1)
+
+    x0_arr.assign(x0_vec)
+    x1_arr.assign(x1_vec)
+
+    return x0_arr, x1_arr
+
+
+
+# ==========================================
+# 2. INIT
+# ==========================================
+f = sint.Array(N)
+g = sint.Array(N)
+@for_range_opt(N)
+def _(i):
+    f[i] = sint(1) # Mock key f, this should be random
+    g[i] = sint(1) # Mock key g, this should be random
+
+
+B_binary_type = sbits.get_type(2 * N)
+B2_MOCK_COLS = 16
+_mock_cols = [sbits.trans([sbit.get_random_bit() for _ in range(2*N)])[0]
+              for _ in range(B2_MOCK_COLS)]
+B2_cols = [_mock_cols[j % B2_MOCK_COLS] for j in range(2*N)]
+
+import random as _mock_rng
+_mock_rng.seed(20260825)
+h_pub = [_mock_rng.getrandbits(1) for _ in range(2*N)]
+
+# ==========================================
+# 3. PRE-COMPUTATION OF ALL POSSIBLE CROSSPRODUCTS (OFFLINE - FLAT SIMD)
+# ==========================================
+
+# Computes Dx, and m
+x0_samples, x1_samples = generate_gaussian_samples_dabit_simd(2 * N)
+dx_vec = x1_samples.get_vector() - x0_samples.get_vector()
+
+# daBit generation
+r_arith, r_binary = sint.get_dabit(size=2*N)
+r_bits = sint.Array(2*N)
+r_bits.assign(r_arith)
+
+m_all = sint.Array(2*N)
+m_all.assign(dx_vec * r_bits.get_vector())
+
+# Computes s_0
+s0_all = sint.Array(2*N)
+s0_all.assign(x0_samples.get_vector() + m_all.get_vector())
+
+# Computes s_1
+s1_all = sint.Array(2*N)
+s1_all.assign(dx_vec - 2 * m_all.get_vector())
+
+F_OFF = N   # x_1, paired with f
+G_OFF = 0   # x_0, paired with g
+
+s0_f = s0_all.get_part(F_OFF, N)
+s1_f = s1_all.get_part(F_OFF, N)
+s0_g = s0_all.get_part(G_OFF, N)
+s1_g = s1_all.get_part(G_OFF, N)
+
+# --- 3.1 / 3.2 Local attribution (0 round) ---
+# M_{j,i} = rot(f)_{j,i} = f[(j - i) mod N], negated exactly where j < i (the
+# anti-cyclic wrap).
+N2 = N * N
+
+COL = regint.inc(N2, 0, 1, N)        # i: each value repeated N times (block index)
+ROW = regint.inc(N2, 0, 1, 1, N)     # j: 0..N-1 cycling within each block
+_delta = ROW - COL
+_wrap = _delta < 0
+ROT_IDX = _delta + N * _wrap         # (j - i) mod N
+ROT_SGN = cint(1 - 2 * _wrap)        # -1 exactly where the anti-cyclic wrap bites
+
+# Array.get compiles to an indirect load_mem. The allocator tracks memory
+# dependencies by address, hence the "Order of# memory instructions not 
+# preserved" warning. This prevents an ordering error
+break_point()
+
+# Column-major: block i holds column i of rot(.).
+Xf_vec = f.get(ROT_IDX) * ROT_SGN
+Xg_vec = g.get(ROT_IDX) * ROT_SGN
+
+s0_f_vec = s0_f.get(COL)
+s1_f_vec = s1_f.get(COL)
+s0_g_vec = s0_g.get(COL)
+s1_g_vec = s1_g.get(COL)
+
+# W0_flat[i*N + j] = M_{j,i} * (s_0)_i   summed over i below to give w_0
+# V_flat [i*N + j] = M_{j,i} * (s_1)_i   the paper's matrix V
+W0_f_flat = sint.Array(N2)
+V_f_flat = sint.Array(N2)
+
+W0_g_flat = sint.Array(N2)
+V_g_flat = sint.Array(N2)
+
+# SIMD Flatten ensuring 1 instruction
+W0_f_flat.assign(Xf_vec * s0_f_vec)
+V_f_flat.assign(Xf_vec * s1_f_vec)
+
+W0_g_flat.assign(Xg_vec * s0_g_vec)
+V_g_flat.assign(Xg_vec * s1_g_vec)
+
+w0 = sint.Array(N)
+w0.assign_all(0)
+
+@for_range_opt(N)
+def _(i):
+    w0.assign(w0.get_vector() + W0_f_flat.get_part(i * N, N).get_vector() - W0_g_flat.get_part(i * N, N).get_vector())
+
+# ==========================================
+# 4. ONLINE PHASE (2 ROUNDS)
+# ==========================================
+
+# [t]_2 = [B]_2 * h = h_1 * B2_cols[1] + ... + h_2m * B2_cols[2n]
+t_bin = B_binary_type(0)
+for j in range(2 * N):
+    if h_pub[j]:
+        t_bin = t_bin ^ B2_cols[j]
+
+# ROUND 1: daBit reveal
+c_reg = (t_bin ^ r_binary).reveal().to_regint_by_bit()
+c = Array(2*N, cint)
+c.assign(cint(c_reg))
+t_prime_f = c.get_part(F_OFF, N)
+t_prime_g = c.get_part(G_OFF, N)
+
+# Local linear combination:  w = w_0 + V * c
+w = sint.Array(N)
+w.assign(w0.get_vector())
+
+@for_range_opt(N)
+def _(i):
+    tp_f = t_prime_f[i]
+    tp_g = t_prime_g[i]
+
+    w.assign(w.get_vector()
+             + V_f_flat.get_part(i * N, N).get_vector() * tp_f
+             - V_g_flat.get_part(i * N, N).get_vector() * tp_g)
+
+# ROUND 2: Signature
+w_clear = w.get_vector().reveal()
